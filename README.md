@@ -39,6 +39,10 @@ npm run dev:mock
 4. 部署。
 5. 一次分析會花幾十秒。`vercel.json` 設了 60 秒上限，請確認你的 Vercel 方案允許這個長度；如果不允許，分析會中途被中斷。
 
+## 三之二、改用 Google Gemini（有免費額度，尚未用真實截圖驗證品質）
+
+後端也能改呼叫 Gemini。在 Vercel 的 Environment Variables 只填 `GEMINI_API_KEY`（不填 `ANTHROPIC_API_KEY`）就會使用 Gemini；刪掉它、改填 `ANTHROPIC_API_KEY` 就換回 Claude。兩把都填時用 `AI_PROVIDER` 指定。用瀏覽器打開 `/api/analyze` 可以看到目前用的是哪一個、金鑰有沒有設好。報告的提示詞是照 Claude 調的，Gemini 的讀數和報告品質要自己用真實截圖確認。免費額度的圖片可能被 Google 用來改進產品。
+
 ## 四、控制費用和濫用
 
 - **Console 每月上限：** 一定要設。

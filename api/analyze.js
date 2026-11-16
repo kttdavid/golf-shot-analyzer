@@ -1,6 +1,7 @@
 /* Backend for Golf Shot Data Interpreter.
    The browser sends { prompt, images:[{media_type,data}], tier, code }.
-   This function adds the secret API key, calls the Claude API and returns { json }.
+   This function adds the secret API key, calls the AI and returns { json }.
+   AI provider: Claude by default. Gemini is used when AI_PROVIDER=gemini, or when only GEMINI_API_KEY is set.
    Nothing is stored or logged: prompts and images are never written anywhere. */
 
 const SYSTEM = 'Return ONLY one valid JSON object. No markdown fences and no text before or after it.';
@@ -29,10 +30,76 @@ function parseJson(text) {
   try { return JSON.parse(t.slice(a, b + 1)); } catch (e) { return undefined; }
 }
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function provider() {
+  const p = String(process.env.AI_PROVIDER || '').toLowerCase();
+  if (p === 'gemini' || p === 'claude') return p;
+  return process.env.GEMINI_API_KEY && !process.env.ANTHROPIC_API_KEY ? 'gemini' : 'claude';
+}
+function keyFor(p) { return p === 'gemini' ? process.env.GEMINI_API_KEY : process.env.ANTHROPIC_API_KEY; }
+
+/* Each caller returns { text } on success or { code, error, status } on failure. */
+async function callClaude(key, prompt, images, complex) {
+  const model = complex
+    ? (process.env.MODEL_COMPLEX || process.env.MODEL_DEFAULT || 'claude-sonnet-5-5')
+    : (process.env.MODEL_DEFAULT || 'claude-sonnet-5-5');
+  const content = images.map(im => ({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: im.data } }));
+  content.push({ type: 'text', text: prompt });
+  let r;
+  try {
+    r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({ model, max_tokens: complex ? 6000 : 4096, system: SYSTEM, messages: [{ role: 'user', content }] })
+    });
+  } catch (e) { return { code: 502, error: 'upstream' }; }
+  if (r.status === 429 || r.status === 529) return { code: 503, error: 'busy' };
+  if (!r.ok) return { code: 502, error: 'upstream', status: r.status };
+  let out; try { out = await r.json(); } catch (e) { return { code: 502, error: 'upstream' }; }
+  return { text: (out.content || []).filter(c => c.type === 'text').map(c => c.text).join('') };
+}
+
+async function callGemini(key, prompt, images, complex) {
+  const base = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta';
+  // Model names change often: try the configured one first, then fall back when a name is not found.
+  const models = [...new Set([complex ? process.env.GEMINI_MODEL_COMPLEX : null, process.env.GEMINI_MODEL, 'gemini-flash-latest', 'gemini-2.5-flash'].filter(Boolean))];
+  const parts = images.map(im => ({ inlineData: { mimeType: 'image/jpeg', data: im.data } }));
+  parts.push({ text: prompt });
+  const payload = JSON.stringify({
+    systemInstruction: { parts: [{ text: SYSTEM }] },
+    contents: [{ role: 'user', parts }],
+    generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 16000 }   // roomy: some models spend output tokens on thinking
+  });
+  let last = { code: 502, error: 'upstream' };
+  for (const model of models) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let r;
+      try {
+        r = await fetch(base + '/models/' + encodeURIComponent(model) + ':generateContent', {
+          method: 'POST', headers: { 'x-goog-api-key': key, 'content-type': 'application/json' }, body: payload
+        });
+      } catch (e) { return { code: 502, error: 'upstream' }; }
+      if (r.status === 404) { last = { code: 502, error: 'upstream', status: 404 }; break; }        // unknown model name: try the next one
+      if (r.status === 429 || r.status === 503) {                                                      // free-tier per-minute limit, or overloaded
+        if (attempt === 0) { await sleep(12000); continue; }
+        return { code: 503, error: 'busy' };
+      }
+      if (!r.ok) return { code: 502, error: 'upstream', status: r.status };
+      let out; try { out = await r.json(); } catch (e) { return { code: 502, error: 'upstream' }; }
+      const c = out.candidates && out.candidates[0];
+      const ps = c && c.content && c.content.parts || [];
+      return { text: ps.filter(x => typeof x.text === 'string' && !x.thought).map(x => x.text).join('') };
+    }
+  }
+  return last;
+}
+
 module.exports = async function handler(req, res) {
   const send = (code, obj) => { res.statusCode = code; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(obj)); };
+  const prov = provider();
+  const key = keyFor(prov);
+  if (req.method === 'GET') return send(200, { provider: prov, configured: !!key });   // setup check; shows no secrets
   if (req.method !== 'POST') return send(405, { error: 'method' });
-  const key = process.env.ANTHROPIC_API_KEY;
   if (!key) return send(500, { error: 'not_configured' });
 
   let body = req.body;
@@ -49,25 +116,9 @@ module.exports = async function handler(req, res) {
   }
   if (overLimit(ipOf(req))) return send(429, { error: 'limit' });
 
-  const model = body.tier === 'complex'
-    ? (process.env.MODEL_COMPLEX || process.env.MODEL_DEFAULT || 'claude-sonnet-5-5')
-    : (process.env.MODEL_DEFAULT || 'claude-sonnet-5-5');
-  const content = images.map(im => ({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: im.data } }));
-  content.push({ type: 'text', text: body.prompt });
-
-  let r;
-  try {
-    r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      body: JSON.stringify({ model, max_tokens: body.tier === 'complex' ? 6000 : 4096, system: SYSTEM, messages: [{ role: 'user', content }] })
-    });
-  } catch (e) { return send(502, { error: 'upstream' }); }
-  if (r.status === 429 || r.status === 529) return send(503, { error: 'busy' });
-  if (!r.ok) return send(502, { error: 'upstream', status: r.status });
-  let out; try { out = await r.json(); } catch (e) { return send(502, { error: 'upstream' }); }
-  const text = (out.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
-  const json = parseJson(text);
+  const out = await (prov === 'gemini' ? callGemini : callClaude)(key, body.prompt, images, body.tier === 'complex');
+  if (out.text === undefined) return send(out.code, out.status ? { error: out.error, status: out.status } : { error: out.error });
+  const json = parseJson(out.text);
   if (json === undefined) return send(502, { error: 'bad_json' });
   return send(200, { json });
 };
