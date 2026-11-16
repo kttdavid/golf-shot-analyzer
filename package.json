@@ -1,0 +1,16 @@
+{
+  "name": "golf-shot-data-interpreter",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Golf Shot Data Interpreter: launch-monitor screenshot analysis (EN / 繁體中文)",
+  "scripts": {
+    "dev": "node dev.js",
+    "dev:mock": "MOCK=1 node dev.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "playwright": "^1.40.0"
+  }
+}
