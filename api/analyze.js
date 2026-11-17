@@ -72,19 +72,24 @@ async function callGemini(key, prompt, images, complex) {
     generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 16000 }   // roomy: some models spend output tokens on thinking
   });
   let last = { code: 502, error: 'upstream' };
-  for (const model of models) {
+  const deadline = Date.now() + 55000;                     // the function itself is cut off at 60 s
+  for (let mi = 0; mi < models.length; mi++) {
+    const model = models[mi];
     for (let attempt = 0; attempt < 2; attempt++) {
+      const left = deadline - Date.now();
+      if (left < 3000) return { code: 503, error: 'busy' };
       let r;
       try {
         r = await fetch(base + '/models/' + encodeURIComponent(model) + ':generateContent', {
-          method: 'POST', headers: { 'x-goog-api-key': key, 'content-type': 'application/json' }, body: payload
+          method: 'POST', headers: { 'x-goog-api-key': key, 'content-type': 'application/json' }, body: payload,
+          signal: AbortSignal.timeout(mi < models.length - 1 ? Math.min(left, 22000) : left)   // a hung model must not use up the whole budget
         });
-      } catch (e) { return { code: 502, error: 'upstream' }; }
+      } catch (e) { last = { code: 503, error: 'busy' }; break; }                              // timed out or unreachable: try the next model
       if (r.status === 404) { last = { code: 502, error: 'upstream', status: 404 }; break; }        // unknown model name: try the next one
       if (r.status === 503 || r.status === 500) { last = { code: 503, error: 'busy' }; break; }          // model overloaded: try the next one
       if (r.status === 429) {                                                                            // free-tier limit: wait once, then try the next model
         last = { code: 503, error: 'busy' };
-        if (attempt === 0) { await sleep(8000); continue; }
+        if (attempt === 0) { await sleep(5000); continue; }
         break;
       }
       if (!r.ok) return { code: 502, error: 'upstream', status: r.status };
@@ -101,20 +106,18 @@ async function callGemini(key, prompt, images, complex) {
 async function testGemini(key) {
   const base = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta';
   const models = [...new Set([process.env.GEMINI_MODEL, ...GEMINI_FALLBACKS].filter(Boolean))];
-  const out = [];
-  for (const model of models) {
+  return Promise.all(models.map(async model => {
     const t0 = Date.now(); let status = 0, message = '';
     try {
       const r = await fetch(base + '/models/' + encodeURIComponent(model) + ':generateContent', {
-        method: 'POST', headers: { 'x-goog-api-key': key, 'content-type': 'application/json' },
+        method: 'POST', headers: { 'x-goog-api-key': key, 'content-type': 'application/json' }, signal: AbortSignal.timeout(15000),
         body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'Reply with the JSON {"ok":true}' }] }], generationConfig: { responseMimeType: 'application/json' } })
       });
       status = r.status;
       if (!r.ok) { try { const j = await r.json(); message = String(j && j.error && j.error.message || '').slice(0, 400); } catch (e) {} }
-    } catch (e) { message = 'network error'; }
-    out.push({ model, status, ms: Date.now() - t0, message });
-  }
-  return out;
+    } catch (e) { message = e && e.name === 'TimeoutError' ? 'no answer within 15 seconds' : 'network error'; }
+    return { model, status, ms: Date.now() - t0, message };
+  }));
 }
 async function testClaude(key) {
   const model = process.env.MODEL_DEFAULT || 'claude-sonnet-5-5';
