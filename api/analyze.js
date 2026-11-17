@@ -94,11 +94,49 @@ async function callGemini(key, prompt, images, complex) {
   return last;
 }
 
+/* Setup test (GET /api/analyze?test=1): one tiny text-only call per model name; reports the AI service's status and error text. */
+async function testGemini(key) {
+  const base = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta';
+  const models = [...new Set([process.env.GEMINI_MODEL, 'gemini-flash-latest', 'gemini-2.5-flash'].filter(Boolean))];
+  const out = [];
+  for (const model of models) {
+    const t0 = Date.now(); let status = 0, message = '';
+    try {
+      const r = await fetch(base + '/models/' + encodeURIComponent(model) + ':generateContent', {
+        method: 'POST', headers: { 'x-goog-api-key': key, 'content-type': 'application/json' },
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'Reply with the JSON {"ok":true}' }] }], generationConfig: { responseMimeType: 'application/json' } })
+      });
+      status = r.status;
+      if (!r.ok) { try { const j = await r.json(); message = String(j && j.error && j.error.message || '').slice(0, 400); } catch (e) {} }
+    } catch (e) { message = 'network error'; }
+    out.push({ model, status, ms: Date.now() - t0, message });
+    if (status === 200) break;
+  }
+  return out;
+}
+async function testClaude(key) {
+  const model = process.env.MODEL_DEFAULT || 'claude-sonnet-5-5';
+  const t0 = Date.now(); let status = 0, message = '';
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST', headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({ model, max_tokens: 20, messages: [{ role: 'user', content: 'Reply with the JSON {"ok":true}' }] })
+    });
+    status = r.status;
+    if (!r.ok) { try { const j = await r.json(); message = String(j && j.error && j.error.message || '').slice(0, 400); } catch (e) {} }
+  } catch (e) { message = 'network error'; }
+  return [{ model, status, ms: Date.now() - t0, message }];
+}
+
 module.exports = async function handler(req, res) {
   const send = (code, obj) => { res.statusCode = code; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(obj)); };
   const prov = provider();
   const key = keyFor(prov);
-  if (req.method === 'GET') return send(200, { provider: prov, configured: !!key });   // setup check; shows no secrets
+  if (req.method === 'GET') {                                                           // setup check; shows no secrets
+    const info = { provider: prov, configured: !!key };
+    if (key && /[?&]test=1/.test(req.url || '') && !overLimit(ipOf(req))) info.test = await (prov === 'gemini' ? testGemini : testClaude)(key);
+    return send(200, info);
+  }
   if (req.method !== 'POST') return send(405, { error: 'method' });
   if (!key) return send(500, { error: 'not_configured' });
 
