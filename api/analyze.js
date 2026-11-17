@@ -30,7 +30,7 @@ function parseJson(text) {
   try { return JSON.parse(t.slice(a, b + 1)); } catch (e) { return undefined; }
 }
 
-const GEMINI_FALLBACKS = ['gemini-flash-latest', 'gemini-3.8-flash', 'gemini-flash-lite-latest'];
+const GEMINI_FALLBACKS = ['gemini-3.8-flash', 'gemini-flash-lite-latest', 'gemini-flash-latest'];   // ordered so an overloaded model fails fast before a slow one
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function provider() {
   const p = String(process.env.AI_PROVIDER || '').toLowerCase();
