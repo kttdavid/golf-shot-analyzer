@@ -30,6 +30,7 @@ function parseJson(text) {
   try { return JSON.parse(t.slice(a, b + 1)); } catch (e) { return undefined; }
 }
 
+const GEMINI_FALLBACKS = ['gemini-flash-latest', 'gemini-3.8-flash', 'gemini-flash-lite-latest'];
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function provider() {
   const p = String(process.env.AI_PROVIDER || '').toLowerCase();
@@ -62,7 +63,7 @@ async function callClaude(key, prompt, images, complex) {
 async function callGemini(key, prompt, images, complex) {
   const base = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta';
   // Model names change often: try the configured one first, then fall back when a name is not found.
-  const models = [...new Set([complex ? process.env.GEMINI_MODEL_COMPLEX : null, process.env.GEMINI_MODEL, 'gemini-flash-latest', 'gemini-2.5-flash'].filter(Boolean))];
+  const models = [...new Set([complex ? process.env.GEMINI_MODEL_COMPLEX : null, process.env.GEMINI_MODEL, ...GEMINI_FALLBACKS].filter(Boolean))];
   const parts = images.map(im => ({ inlineData: { mimeType: 'image/jpeg', data: im.data } }));
   parts.push({ text: prompt });
   const payload = JSON.stringify({
@@ -80,9 +81,11 @@ async function callGemini(key, prompt, images, complex) {
         });
       } catch (e) { return { code: 502, error: 'upstream' }; }
       if (r.status === 404) { last = { code: 502, error: 'upstream', status: 404 }; break; }        // unknown model name: try the next one
-      if (r.status === 429 || r.status === 503) {                                                      // free-tier per-minute limit, or overloaded
-        if (attempt === 0) { await sleep(12000); continue; }
-        return { code: 503, error: 'busy' };
+      if (r.status === 503 || r.status === 500) { last = { code: 503, error: 'busy' }; break; }          // model overloaded: try the next one
+      if (r.status === 429) {                                                                            // free-tier limit: wait once, then try the next model
+        last = { code: 503, error: 'busy' };
+        if (attempt === 0) { await sleep(8000); continue; }
+        break;
       }
       if (!r.ok) return { code: 502, error: 'upstream', status: r.status };
       let out; try { out = await r.json(); } catch (e) { return { code: 502, error: 'upstream' }; }
@@ -97,7 +100,7 @@ async function callGemini(key, prompt, images, complex) {
 /* Setup test (GET /api/analyze?test=1): one tiny text-only call per model name; reports the AI service's status and error text. */
 async function testGemini(key) {
   const base = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta';
-  const models = [...new Set([process.env.GEMINI_MODEL, 'gemini-flash-latest', 'gemini-2.5-flash'].filter(Boolean))];
+  const models = [...new Set([process.env.GEMINI_MODEL, ...GEMINI_FALLBACKS].filter(Boolean))];
   const out = [];
   for (const model of models) {
     const t0 = Date.now(); let status = 0, message = '';
@@ -110,7 +113,6 @@ async function testGemini(key) {
       if (!r.ok) { try { const j = await r.json(); message = String(j && j.error && j.error.message || '').slice(0, 400); } catch (e) {} }
     } catch (e) { message = 'network error'; }
     out.push({ model, status, ms: Date.now() - t0, message });
-    if (status === 200) break;
   }
   return out;
 }
